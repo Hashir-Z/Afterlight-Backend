@@ -1,3 +1,4 @@
+import asyncio
 import os
 import shutil
 import struct
@@ -9,10 +10,15 @@ from typing import Optional
 import httpx
 import numpy as np
 import torchaudio
+import signal
+
+if not hasattr(signal, "SIGKILL"):
+	signal.SIGKILL = signal.SIGTERM
 
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+import nemo.collections.asr as nemo_asr
 
 # Add Matcha-TTS to path
 COSYVOICE_DIR = Path(__file__).resolve().parent
@@ -37,8 +43,9 @@ USER_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 GENERATED_DIR.mkdir(parents=True, exist_ok=True)
 ROOT_GENERATED_DIR.mkdir(parents=True, exist_ok=True)
 
-# Global model instance (will be initialized at startup)
+# Global model instances (will be initialized at startup)
 cosyvoice: Optional[CosyVoice2] = None
+asr_model: Optional[nemo_asr.models.ASRModel] = None
 
 # LLM API configuration
 LLM_MODEL = "openai/gpt-oss-20b"
@@ -59,7 +66,7 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
 	"""Initialize CosyVoice model at server startup."""
-	global cosyvoice
+	global cosyvoice, asr_model
 	print("Loading CosyVoice2 model...")
 	try:
 		model_path = COSYVOICE_DIR / "pretrained_models" / "CosyVoice2-0.5B"
@@ -73,6 +80,14 @@ async def startup_event():
 		print("CosyVoice2 model loaded successfully!")
 	except Exception as e:
 		print(f"Failed to load CosyVoice2 model: {e}")
+		raise
+
+	print("Loading Parakeet ASR model...")
+	try:
+		asr_model = nemo_asr.models.ASRModel.from_pretrained("nvidia/parakeet-tdt-0.6b-v2")
+		print("Parakeet ASR model loaded successfully!")
+	except Exception as e:
+		print(f"Failed to load Parakeet ASR model: {e}")
 		raise
 
 
@@ -206,6 +221,35 @@ async def _get_llm_response(transcript: str) -> str:
 		raise HTTPException(status_code=500, detail=f"Failed to get LLM response: {str(e)}")
 
 
+async def _transcribe_audio_file(audio_path: Path) -> str:
+	"""Use Parakeet ASR to transcribe the provided audio file."""
+	if asr_model is None:
+		raise HTTPException(status_code=500, detail="ASR model not initialized.")
+
+	loop = asyncio.get_running_loop()
+
+	def _transcribe_sync() -> str:
+		transcriptions = asr_model.transcribe([str(audio_path)])
+		if not transcriptions or not transcriptions[0]:
+			raise ValueError("ASR model returned empty transcription.")
+		text = transcriptions[0]
+		if isinstance(text, list):
+			text = " ".join(
+				seg.strip() for seg in text if isinstance(seg, str) and seg.strip()
+			)
+		elif not isinstance(text, str):
+			text = str(text)
+		text = text.strip()
+		if not text:
+			raise ValueError("ASR transcription text was empty.")
+		return text
+
+	try:
+		return await loop.run_in_executor(None, _transcribe_sync)
+	except Exception as e:
+		raise HTTPException(status_code=500, detail=f"ASR transcription failed: {str(e)}")
+
+
 def _create_wav_header(sample_rate: int, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:
 	"""Create a WAV file header with placeholder file size (0xFFFFFFFF for streaming)."""
 	# WAV header structure
@@ -270,20 +314,13 @@ def _generate_audio_stream(audio_name_no_ext: str, transcript: str, desired_tts:
 
 @app.post("/generate")
 async def generate(
-	transcript: str = Form(...),
+	transcript: Optional[str] = Form(default=None),
 	desired_tts: Optional[str] = Form(default=None),
 	file_hash: str = Form(...),
 	file: Optional[UploadFile] = File(default=None),
 ):
-	if not transcript or not file_hash:
-		raise HTTPException(status_code=400, detail="transcript and file_hash are required.")
-	
-	# Get desired_tts from LLM API using transcript
-	try:
-		desired_tts2 = await _get_llm_response(transcript)
-		print(f"LLM generated text: {desired_tts2[:100]}...")  # Log first 100 chars
-	except Exception as e:
-		raise HTTPException(status_code=500, detail=f"Failed to generate text from LLM: {str(e)}")
+	if not file_hash:
+		raise HTTPException(status_code=400, detail="file_hash is required.")
 	
 	audio_name_no_ext = file_hash
 	
@@ -328,6 +365,17 @@ async def generate(
 		# No file provided and no existing file found
 		raise HTTPException(status_code=400, detail=f"File not found for hash {file_hash}. Please upload the file.")
 
+	# Automatically generate transcript from audio
+	transcript = await _transcribe_audio_file(converted_wav_path)
+	print(f"ASR transcript (full): {transcript}")
+
+	# Get desired_tts from LLM API using transcript
+	try:
+		desired_tts = await _get_llm_response(transcript)
+		print(f"LLM generated text: {desired_tts[:100]}...")  # Log first 100 chars
+	except Exception as e:
+		raise HTTPException(status_code=500, detail=f"Failed to generate text from LLM: {str(e)}")
+
 	# Stream audio chunks directly to the client
 	try:
 		# Return streaming response with audio chunks
@@ -335,7 +383,7 @@ async def generate(
 			_generate_audio_stream(
 				audio_name_no_ext=audio_name_no_ext,
 				transcript=transcript,
-				desired_tts=desired_tts2
+				desired_tts=desired_tts
 			),
 			media_type="audio/wav",
 			headers={
