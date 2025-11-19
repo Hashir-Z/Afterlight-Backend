@@ -1,0 +1,6 @@
+/examples
+__pycache__/
+/GeneratedAudio
+/.github
+/pretrained_models/CosyVoice2-0.5B
+/UserAudio
