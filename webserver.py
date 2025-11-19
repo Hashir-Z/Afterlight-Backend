@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+import httpx
 import numpy as np
 import torchaudio
 
@@ -38,6 +39,10 @@ ROOT_GENERATED_DIR.mkdir(parents=True, exist_ok=True)
 
 # Global model instance (will be initialized at startup)
 cosyvoice: Optional[CosyVoice2] = None
+
+# LLM API configuration
+LLM_MODEL = "openai/gpt-oss-20b"
+LLM_API_URL = "http://127.0.0.1:1234/v1/responses"
 
 app = FastAPI(title="CosyVoice WebServer", version="1.0.0")
 
@@ -171,6 +176,36 @@ def _extract_16bit_wav(input_path: Path, output_path: Path) -> None:
 		raise RuntimeError(f"ffmpeg failed: {proc.stderr.strip()}")
 
 
+async def _get_llm_response(transcript: str) -> str:
+	"""Send transcript to LLM API and return the generated text."""
+	try:
+		async with httpx.AsyncClient(timeout=60.0) as client:
+			response = await client.post(
+				LLM_API_URL,
+				json={
+					"model": LLM_MODEL,
+					"input": transcript
+				},
+				headers={"Content-Type": "application/json"}
+			)
+			response.raise_for_status()
+			result = response.json()
+			
+			# Parse the response to extract text from output[0].content[0].text
+			if "output" in result and len(result["output"]) > 0:
+				output_item = result["output"][0]
+				if "content" in output_item and len(output_item["content"]) > 0:
+					content_item = output_item["content"][0]
+					if "text" in content_item:
+						return content_item["text"]
+			
+			raise ValueError("Could not parse LLM response: missing text field")
+	except httpx.HTTPError as e:
+		raise HTTPException(status_code=500, detail=f"LLM API request failed: {str(e)}")
+	except Exception as e:
+		raise HTTPException(status_code=500, detail=f"Failed to get LLM response: {str(e)}")
+
+
 def _create_wav_header(sample_rate: int, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:
 	"""Create a WAV file header with placeholder file size (0xFFFFFFFF for streaming)."""
 	# WAV header structure
@@ -236,12 +271,19 @@ def _generate_audio_stream(audio_name_no_ext: str, transcript: str, desired_tts:
 @app.post("/generate")
 async def generate(
 	transcript: str = Form(...),
-	desired_tts: str = Form(...),
+	desired_tts: Optional[str] = Form(default=None),
 	file_hash: str = Form(...),
 	file: Optional[UploadFile] = File(default=None),
 ):
-	if not transcript or not desired_tts or not file_hash:
-		raise HTTPException(status_code=400, detail="transcript, desired_tts, and file_hash are required.")
+	if not transcript or not file_hash:
+		raise HTTPException(status_code=400, detail="transcript and file_hash are required.")
+	
+	# Get desired_tts from LLM API using transcript
+	try:
+		desired_tts2 = await _get_llm_response(transcript)
+		print(f"LLM generated text: {desired_tts2[:100]}...")  # Log first 100 chars
+	except Exception as e:
+		raise HTTPException(status_code=500, detail=f"Failed to generate text from LLM: {str(e)}")
 	
 	audio_name_no_ext = file_hash
 	
@@ -293,7 +335,7 @@ async def generate(
 			_generate_audio_stream(
 				audio_name_no_ext=audio_name_no_ext,
 				transcript=transcript,
-				desired_tts=desired_tts
+				desired_tts=desired_tts2
 			),
 			media_type="audio/wav",
 			headers={
